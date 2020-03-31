@@ -82,6 +82,8 @@ class DataProcessor(object):
     def get_labels(self, data_dir, negative_label="no_relation"):
         """See base class."""
         dataset = self._read_json(os.path.join(data_dir, "train.json"))
+        # dataset += self._read_json(os.path.join(data_dir, "dev.json"))
+        # dataset += self._read_json(os.path.join(data_dir, "test.json"))
         count = Counter()
         for example in dataset:
             count[example['relation']] += 1
@@ -350,6 +352,9 @@ def main(args):
 
     if args.do_train:
         train_examples = processor.get_train_examples(args.data_dir)
+        # train_examples_dict = [{'guid': example.guid, 'sentence': example.sentence, 'span1': example.span1, 'span2': example.span2, 'ner1': example.ner1, 'ner2': example.ner2, 'label':  example.label} for example in train_examples]
+        # with open('/media/discoD/Corpora/TACRED/tacred/data/json/train_simple.json', 'w') as outfile:
+        #     json.dump(train_examples_dict, outfile, indent=4, sort_keys=True)
         train_features = convert_examples_to_features(
                 train_examples, label2id, args.max_seq_length, tokenizer, special_tokens, args.feature_mode)
 
@@ -381,8 +386,8 @@ def main(args):
         for lr in lrs:
             model = BertForSequenceClassification.from_pretrained(
                 args.model, cache_dir=str(PYTORCH_PRETRAINED_BERT_CACHE), num_labels=num_labels)
-            if args.fp16:
-                model.half()
+            # if args.fp16:
+            #     model.half()
             model.to(device)
             if n_gpu > 1:
                 model = torch.nn.DataParallel(model)
@@ -396,21 +401,31 @@ def main(args):
                             if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
             ]
             if args.fp16:
+                # try:
+                #     from apex.optimizers import FP16_Optimizer
+                #     from apex.optimizers import FusedAdam
+                # except ImportError:
+                #     raise ImportError("Please install apex from https://www.github.com/nvidia/apex"
+                #                       "to use distributed and fp16 training.")
+
+
+                #
+                # if args.loss_scale == 0:
+                #     optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+                # else:
+                #     optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
                 try:
-                    from apex.optimizers import FP16_Optimizer
                     from apex.optimizers import FusedAdam
+                    from apex import amp
                 except ImportError:
-                    raise ImportError("Please install apex from https://www.github.com/nvidia/apex"
-                                      "to use distributed and fp16 training.")
+                    raise ImportError(
+                        "Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
                 optimizer = FusedAdam(optimizer_grouped_parameters,
                                       lr=lr,
-                                      bias_correction=False,
-                                      max_grad_norm=1.0)
-                if args.loss_scale == 0:
-                    optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-                else:
-                    optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
+                                      bias_correction=False)
+
+                model, optimizer = amp.initialize(model, optimizer)
 
             else:
                 optimizer = BertAdam(optimizer_grouped_parameters,
@@ -438,7 +453,8 @@ def main(args):
                         loss = loss / args.gradient_accumulation_steps
 
                     if args.fp16:
-                        optimizer.backward(loss)
+                        with amp.scale_loss(loss, optimizer) as scaled_loss:
+                            scaled_loss.backward()
                     else:
                         loss.backward()
 
@@ -448,10 +464,10 @@ def main(args):
 
                     if (step + 1) % args.gradient_accumulation_steps == 0:
                         if args.fp16:
-                            lr_this_step = lr * \
-                                warmup_linear(global_step/num_train_optimization_steps, args.warmup_proportion)
-                            for param_group in optimizer.param_groups:
-                                param_group['lr'] = lr_this_step
+                            if args.fp16:
+                                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                            else:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                         optimizer.step()
                         optimizer.zero_grad()
                         global_step += 1
@@ -565,5 +581,6 @@ if __name__ == "__main__":
                         help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     args = parser.parse_args()
     main(args)
